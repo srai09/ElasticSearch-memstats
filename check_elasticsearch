@@ -1,0 +1,132 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Getopt::Long qw(:config no_ignore_case);;
+use LWP::UserAgent;
+use JSON;
+use Data::Dumper;
+
+my %ERRORS = ( "OK", 0, "WARNING", 1, "CRITICAL", 2, "UNKNOWN", 3);
+my $state = 'UNKNOWN';
+my $output    = "Plugin Error";
+my ($hostname, $help, $port, $warning_heap_used, $critical_heap_used, $script_format, $path);
+#default values
+($port=9200,$warning_heap_used=90,$critical_heap_used=98,$script_format="nagios", $path = '/_nodes/jvm/stats');
+
+GetOptions(
+        "H|hostname=s"                  => \$hostname,
+        "h|help"                        => \$help,
+        "p|port=i"                      => \$port,
+        "w_h|warning-heap=f"            => \$warning_heap_used,
+        "c_h|critical-heap=f"           => \$critical_heap_used,
+        "S|script_format=s"             => \$script_format,
+        "P|path=s"                      => \$path,
+);
+
+if ($help){
+        help();
+        exit 3;
+}
+
+if (!$hostname) {
+        print "No hostname specified. $0 --help  for usage.\n";
+#       help();
+        exit 3;
+}
+
+my $url = "http://$hostname:$port$path";
+my $ua = LWP::UserAgent->new;
+my $request = HTTP::Request->new( GET => $url );
+my $response = $ua->request($request);
+
+# Check HTTP response
+if ( $response->is_success ) {
+        my $json = new JSON;
+        my $obj = $json->decode( $response->content );
+        my %response_hash= %{$obj};
+        my %node_hash = %{$response_hash{nodes}};
+        my @keys = keys %node_hash;
+        my $node_id;
+        #Loop through the node-ids in the cluster to get node-id for the host specified, as node-id keeps changing.
+        foreach my $key(keys %node_hash){
+                if (($node_hash{$key}{transport_address} =~ /$hostname/) or ($hostname =~ /$node_hash{$key}{hostname}/)){
+                        $node_id = $key;
+                }
+        }
+        my $heap_used_percent= $node_hash{$node_id}{jvm}{mem}{heap_used_percent};
+        #Check script output format
+        if ($script_format =~ /nagios/i){
+                if ($heap_used_percent >= $critical_heap_used){
+                        $state='CRITICAL';
+                }elsif ($heap_used_percent >= $warning_heap_used){
+                        $state='WARNING';
+                }else{
+                        $state='OK';
+                }
+
+                $output="Heap Used Percentage: $heap_used_percent\n";
+        }elsif ($script_format =~ /cacti/i){
+                my $total_heap = $node_hash{$node_id}{jvm}{mem}{heap_max_in_bytes};
+                my $heap_used = $node_hash{$node_id}{jvm}{mem}{heap_used_in_bytes};
+                my $g1_eden_space_used = $node_hash{$node_id}{jvm}{mem}{pools}{'G1 Eden Space'}{used_in_bytes};
+                my $g1_survivor_space_used = $node_hash{$node_id}{jvm}{mem}{pools}{'G1 Survivor Space'}{used_in_bytes};
+                my $g1_old_gen_space_used = $node_hash{$node_id}{jvm}{mem}{pools}{'G1 Old Gen'}{used_in_bytes};
+                #checking the output and converting to GB
+                if(!defined($total_heap)) {
+                        $total_heap = 0;
+                }else{
+                        $total_heap = sprintf("%0.2f",$total_heap/(1024*1024*1024));
+                }
+                if(!defined($heap_used)) {
+                        $heap_used = 0;
+                }else{
+                        $heap_used = sprintf("%0.2f", $heap_used/(1024*1024*1024));
+                }
+                if(!defined($g1_eden_space_used)) {
+                        $g1_eden_space_used = 0;
+                }else{
+                        $g1_eden_space_used = sprintf("%0.2f", $g1_eden_space_used/(1024*1024*1024));
+                }
+                if(!defined($g1_old_gen_space_used)) {
+                        $g1_old_gen_space_used = 0;
+                }else{
+                        $g1_old_gen_space_used = sprintf("%0.2f", $g1_old_gen_space_used/(1024*1024*1024));
+                }
+                if(!defined($g1_survivor_space_used)) {
+                        $g1_survivor_space_used = 0;
+                }else{
+                        $g1_survivor_space_used = sprintf("%0.2f", $g1_survivor_space_used/(1024*1024*1024));
+                }
+                $output="Total_Heap_Size:$total_heap Heap_Used:$heap_used G1_Eden_Space_Used:$g1_eden_space_used G1_Survivor_Space_Used:$g1_survivor_space_used G1_Old_Gen_Space_Used:$g1_old_gen_space_used\n";
+                #print Dumper($node_hash{$node_id});
+        }
+}
+else {
+        print STDERR $response->status_line, "\n";
+        exit $ERRORS{'UNKNOWN'}
+
+}
+
+print $output;
+exit $ERRORS{$state};
+
+# Help
+sub help {
+    print <<EOT
+---------------------------------------------------------------------------------------------
+Script to check Elastic Search Memory Utilization
+Can be used for to plot cacti graphs as well see options.
+
+Usage: ./check_elasticsearch -H <hostname>
+
+Options: 
+        -H|--hostname           Hostname or IP address of ElasticSearch server.
+        -h|--help               Print this help.
+        -p|--port               ElasticSearch port number (default: 9200).
+        -w_h|--warning-heap     Warning threshold percentage for heap utilization (default:90).
+        -c_h|--critical-heap    Critical threshold percentage for heap utilization (default:96).        
+        -S|--script_format      Script output format. [Options: Nagios|Cacti] (default:Nagios).
+        -P|--path               URL path (default: <\$hostname/_node/jvm/stats).
+EOT
+}
